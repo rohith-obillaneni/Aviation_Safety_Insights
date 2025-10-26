@@ -9,7 +9,7 @@ from src.agent_graph import run_agentic
 
 # ---------- STREAMLIT BASE CONFIG ----------
 st.set_page_config(
-    page_title="✈️ Aviation Risk Radar",
+    page_title="✈️ Aviation Risk Radar Insights",
     layout="wide",
 )
 
@@ -275,7 +275,7 @@ st.markdown(
         <div class="top-nav-left">
             <div class="app-title">
                 <span class="title-emoji">✈️</span>
-                <span>Aviation Risk Radar</span>
+                <span>Aviation Risk Radar Insights</span>
             </div>
             <div class="app-badge">Internal Safety Radar</div>
         </div>
@@ -299,7 +299,7 @@ tabs = st.tabs([
 # TAB 1: ASK MODE (INVESTIGATION)
 # =====================================================================================
 with tabs[0]:
-    st.markdown("### Focused safety question")
+    st.markdown("### Ask Focused safety question")
     st.caption(
         "Use this to investigate a specific scenario (e.g. \"ATC confusion on Descent last week\"). "
         "You’ll get main drivers, exposure distribution, and the report_numbers to pull."
