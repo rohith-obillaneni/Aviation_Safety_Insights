@@ -10,29 +10,82 @@ from .utils import connect_pinecone, embed_texts, df_from_matches, build_stats
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
-def _post_filter(
-    df: pd.DataFrame,
-    date_from: Optional[str],
-    date_to: Optional[str],
-    phase: Optional[str],
-) -> pd.DataFrame:
-    out = df.copy()
-    # Filter by date range if provided (inclusive)
-    if date_from and "date" in out.columns:
-        out = out[out["date"] >= datetime.fromisoformat(date_from).date()]
-    if date_to and "date" in out.columns:
-        out = out[out["date"] <= datetime.fromisoformat(date_to).date()]
+def _post_filter(df: pd.DataFrame,
+                 date_from: Optional[str],
+                 date_to: Optional[str],
+                 phase: Optional[str]) -> pd.DataFrame:
+    """
+    Apply optional user filters:
+    - date range (inclusive)
+    - flight phase
 
-    # Filter by phase (case-insensitive contains match)
+    This version is defensive:
+    - we always coerce df['datetime'] to pandas datetime[ns, UTC] if possible
+    - we always create df['date'] as pure datetime.date for safe comparison
+    - we only filter if the user actually passed a value
+    """
+
+    out = df.copy()
+
+    # 1. Normalise datetime -> date
+    # We accept a few possible column situations:
+    #   - 'datetime' exists (string or timestamp-like)
+    #   - 'date' might already be there but as string
+    if "datetime" in out.columns:
+        out["datetime"] = pd.to_datetime(
+            out["datetime"],
+            errors="coerce",
+            utc=True
+        )
+        out["date"] = out["datetime"].dt.date
+    else:
+        # Fallback: if no datetime column, but there *is* a 'date' column,
+        # try to coerce that to datetime.date values.
+        if "date" in out.columns:
+            # coerce to datetime64 first, then take .dt.date
+            tmp = pd.to_datetime(out["date"], errors="coerce", utc=True)
+            out["date"] = tmp.dt.date
+        else:
+            # No temporal info at all, just return early.
+            # (We can't do date filtering with no dates.)
+            out["date"] = pd.NaT
+
+    # 2. Filter by date_from / date_to if provided
+    # The incoming values (date_from, date_to) are strings like "2025-08-04".
+    # We'll turn them into datetime.date.
+    if date_from:
+        try:
+            start_date = datetime.fromisoformat(date_from).date()
+            # Keep only rows where out["date"] is not NaT and >= start_date
+            out = out[
+                out["date"].apply(lambda d: (pd.notna(d) and d >= start_date))
+            ]
+        except ValueError:
+            # If parsing fails, we just skip filtering on that bound.
+            pass
+
+    if date_to:
+        try:
+            end_date = datetime.fromisoformat(date_to).date()
+            out = out[
+                out["date"].apply(lambda d: (pd.notna(d) and d <= end_date))
+            ]
+        except ValueError:
+            pass
+
+    # 3. Filter by phase (case-insensitive contains match on 'flight_phase')
     if phase and "flight_phase" in out.columns:
-        phase_low = phase.strip().lower()
+        want_phase = str(phase).strip().lower()
         out = out[
             out["flight_phase"]
-            .fillna("")
+            .astype(str)
+            .str.strip()
             .str.lower()
-            .str.contains(phase_low)
+            .str.contains(want_phase, na=False)
         ]
+
     return out
+
 
 def retrieve_for_question(
     settings: Settings,

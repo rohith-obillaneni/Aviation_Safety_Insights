@@ -299,82 +299,126 @@ tabs = st.tabs([
 # TAB 1: ASK MODE (INVESTIGATION)
 # =====================================================================================
 with tabs[0]:
-    st.markdown('<div class="section-title">Focused safety question</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-hint">'
-        "Use this to investigate a specific scenario (eg ATC confusion on Descent last week). "
+    st.markdown("### Focused safety question")
+    st.caption(
+        "Use this to investigate a specific scenario (e.g. \"ATC confusion on Descent last week\"). "
         "You’ll get main drivers, exposure distribution, and the report_numbers to pull."
-        '</div>',
-        unsafe_allow_html=True,
     )
 
-    question = st.text_input("Question to investigate")
+    # Natural language question
+    question = st.text_input(
+        "Question to investigate",
+        value="ATC confusion on Descent last week",
+        help="Describe the scenario you care about. We'll retrieve similar incidents and summarise them."
+    )
+
+    st.write("")  # spacer line
+
     col1, col2, col3 = st.columns(3)
+
     with col1:
-        date_from = st.text_input("Date from (YYYY-MM-DD, optional)", value="")
+        date_from_val = st.date_input(
+            "Date from (optional)",
+            value=None,
+            format="YYYY-MM-DD",
+            key="ask_date_from",
+            help="Earliest date to include"
+        )
+
     with col2:
-        date_to = st.text_input("Date to (YYYY-MM-DD, optional)", value="")
+        date_to_val = st.date_input(
+            "Date to (optional)",
+            value=None,
+            format="YYYY-MM-DD",
+            key="ask_date_to",
+            help="Latest date to include"
+        )
+
     with col3:
-        phase_filter = st.text_input("Flight phase (e.g. Approach, optional)", value="")
+        phase_options = [
+            "(any)",
+            "Parked",
+            "Taxi",
+            "Initial Climb",
+            "Climb",
+            "Cruise",
+            "Descent",
+            "Initial Approach",
+            "Final Approach",
+            "Landing",
+        ]
+        phase_choice = st.selectbox(
+            "Flight phase (optional)",
+            phase_options,
+            index=0,  # default to "(any)"
+            help="Filter incidents to a specific phase of flight"
+        )
 
-    if st.button("Run Ask"):
-        # Build agent query text
-        q_full = (question or "").strip()
-        if date_from and date_to:
-            q_full += f" between {date_from} and {date_to}"
-        elif date_from:
-            q_full += f" after {date_from}"
-        elif date_to:
-            q_full += f" before {date_to}"
-        if phase_filter:
-            q_full += f" during {phase_filter}"
+    # Run button (green primary)
+    if st.button("Run Ask", type="primary"):
+        # We'll build a machine-readable query for the agent.
+        # Dates must appear as 'YYYY-MM-DD to YYYY-MM-DD' so _parse_filters can read them.
+        q_full = question.strip()
 
-        with st.spinner("Retrieving similar incidents and summarising drivers…"):
-            result = run_agentic(q_full)
+        date_from_str = date_from_val.isoformat() if date_from_val else ""
+        date_to_str   = date_to_val.isoformat() if date_to_val else ""
 
-        mode = result.get("mode", "?")
-        ans = result.get("answer") or {}
-        df_ev = result.get("df")
+        if date_from_str and date_to_str:
+            q_full += f" {date_from_str} to {date_to_str}"
+        elif date_from_str:
+            q_full += f" from {date_from_str}"
+        elif date_to_str:
+            q_full += f" to {date_to_str}"
 
-        st.markdown(f"**Agent mode:** `{mode}`")
+        # Add phase in readable English so _parse_filters() can pick it up
+        # (it looks for keywords like 'approach', 'descent', 'takeoff')
+        if phase_choice and phase_choice != "(any)":
+            q_full += f" during {phase_choice}"
 
-        if mode != "ask":
+        with st.spinner("Retrieving similar incidents, applying filters, and analysing risk drivers..."):
+            # IMPORTANT: we now pass BOTH
+            result = run_agentic(
+                full_query=q_full,
+                raw_question=question.strip(),  # clean semantic query for Pinecone
+            )
+
+        st.markdown(f"**Agent mode:** `{result['mode']}`")
+
+        if result["mode"] != "ask":
             st.warning(
-                "This looks like a fleet/trend request. "
-                "Use **🧭 Discover** to run the full risk sweep."
-            )
-        else:
-            # ===== Summary card (bigger font, highlighted) =====
-            st.markdown(
-                "<div class='summary-card'>"
-                "<div class='summary-head'>Summary</div>"
-                f"<div class='summary-body'>{ans.get('summary','')}</div>"
-                "</div>",
-                unsafe_allow_html=True,
+                "Your question is broad (fleet-level patterns / spikes). "
+                "Open the '🧭 Discover' tab and run 'Fleet risk sweep' "
+                "for the risk radar view."
             )
 
-            # ===== Key signals with evidence =====
+        else:
+            ans = result["answer"] or {}
+
+            st.markdown("#### Summary")
+            st.write(ans.get("summary", "No summary available."))
+
+            # Key signals
             claims = ans.get("claims", [])
             if claims:
-                st.markdown('<div class="section-title">Key signals in this subset</div>', unsafe_allow_html=True)
+                st.markdown("**Key signals in this subset**")
                 for c in claims:
                     st.markdown(
-                        f"<div class='body-text'>• {c['text']} — "
-                        f"reports: <code>{', '.join(c['citations'])}</code></div>",
-                        unsafe_allow_html=True,
+                        f"- {c['text']} — reports: `{', '.join(c['citations'])}`"
                     )
 
-            # ===== Exposure breakdown charts =====
+            # Charts / stats
             stats = ans.get("stats", {})
             if stats:
-                st.markdown('<div class="section-title">Exposure breakdown</div>', unsafe_allow_html=True)
+                st.markdown("#### Exposure breakdown")
                 col_a, col_b, col_c = st.columns(3)
 
                 with col_a:
                     if stats.get("by_cause"):
-                        st.markdown('<div class="table-title">Top causes</div>', unsafe_allow_html=True)
-                        dfc = pd.DataFrame(list(stats["by_cause"].items()),
-                                           columns=["Cause", "Count"])
+                        st.markdown("**Top causes**")
+                        dfc = pd.DataFrame(
+                            list(stats["by_cause"].items()),
+                            columns=["Cause","Count"],
+                        )
                         if not dfc.empty:
                             fig, ax = plt.subplots()
                             ax.bar(dfc["Cause"], dfc["Count"])
@@ -385,9 +429,11 @@ with tabs[0]:
 
                 with col_b:
                     if stats.get("by_phase"):
-                        st.markdown('<div class="table-title">Top phases</div>', unsafe_allow_html=True)
-                        dfp = pd.DataFrame(list(stats["by_phase"].items()),
-                                           columns=["Phase", "Count"])
+                        st.markdown("**Top phases**")
+                        dfp = pd.DataFrame(
+                            list(stats["by_phase"].items()),
+                            columns=["Phase","Count"],
+                        )
                         if not dfp.empty:
                             fig, ax = plt.subplots()
                             ax.bar(dfp["Phase"], dfp["Count"])
@@ -398,25 +444,26 @@ with tabs[0]:
 
                 with col_c:
                     if stats.get("risk"):
-                        st.markdown(
-                            '<div class="table-title">Risk score distribution (higher = more severe)</div>',
-                            unsafe_allow_html=True,
+                        st.markdown("**Risk score distribution (higher = more severe)**")
+                        dfrisk = pd.DataFrame(
+                            list(stats["risk"].items()),
+                            columns=["RiskScore","Count"],
                         )
-                        dfrisk = pd.DataFrame(list(stats["risk"].items()),
-                                              columns=["RiskScore","Count"])
                         if not dfrisk.empty:
                             fig, ax = plt.subplots()
                             ax.bar(dfrisk["RiskScore"], dfrisk["Count"])
                             ax.set_xticks(range(len(dfrisk["RiskScore"])))
-                            ax.set_xticklabels(dfrisk["RiskScore"],
-                                               rotation=0, ha="center")
+                            ax.set_xticklabels(
+                                dfrisk["RiskScore"], rotation=0, ha="center"
+                            )
                             ax.set_ylabel("Count")
                             st.pyplot(fig)
 
-            # ===== Evidence table =====
+            # Evidence table
+            df_ev = result.get("df")
             if isinstance(df_ev, pd.DataFrame) and not df_ev.empty:
-                st.markdown('<div class="section-title">Evidence incidents (top matches)</div>', unsafe_allow_html=True)
-                cols_to_show = [
+                st.markdown("#### Evidence incidents (top matches)")
+                show_cols = [
                     "report_number",
                     "datetime",
                     "flight_phase",
@@ -425,10 +472,15 @@ with tabs[0]:
                     "miss_distance",
                     "score",
                 ]
-                cols_to_show = [c for c in cols_to_show if c in df_ev.columns]
-                display_df = df_ev[cols_to_show].head(50).copy()
-                display_df = display_df.fillna("—")
-                st.dataframe(display_df, use_container_width=True)
+                show_cols = [c for c in show_cols if c in df_ev.columns]
+                st.dataframe(df_ev[show_cols].head(50), use_container_width=True)
+            else:
+                st.info(
+                    "No matching incidents were found for the specified criteria. "
+                    "Try loosening the phase, or narrowing the natural-language bit "
+                    "(for example, 'ATC confusion on Descent', not 'last week')."
+                )
+
 
     st.markdown(
         '<div class="small-note">'

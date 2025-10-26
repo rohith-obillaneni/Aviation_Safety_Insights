@@ -15,6 +15,33 @@ _ST_MODEL_CACHE: dict[str, SentenceTransformer] = {}
 # utils.py
 import pandas as pd
 import numpy as np
+# --- ADD near the top of src/utils.py ---
+import pandas as pd
+import numpy as np
+
+def normalise_datetime_and_month(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parse 'datetime' robustly and create a reliable string month bucket.
+    - Accepts naive/tz-aware/mixed; coerces to UTC then drops tz for period ops.
+    - Only sets 'month' when we truly have a timestamp.
+    """
+    if "datetime" not in df.columns:
+        df["month"] = np.nan
+        return df
+
+    # Parse -> UTC -> drop tz for period bucketing
+    dt = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+    df["datetime"] = dt
+
+    has_dt = dt.notna()
+    if has_dt.any():
+        # convert to naive (no tz) purely for period buckets
+        dt_naive = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+        df.loc[has_dt, "month"] = dt_naive[has_dt].dt.to_period("M").astype(str)
+    else:
+        df["month"] = np.nan
+
+    return df
 
 def enrich_incident_df(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -147,7 +174,7 @@ def df_from_matches(matches: List[Dict[str, Any]]) -> pd.DataFrame:
         df["risk_numeric"] = df["risk_level"].map(_risk_map)
     else:
         df["risk_numeric"] = np.nan
-
+    df = normalise_datetime_and_month(df)
     return df
 
 def build_stats(df: pd.DataFrame) -> Dict[str, Any]:

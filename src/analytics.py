@@ -321,41 +321,182 @@ def extract_critical5(df: pd.DataFrame) -> List[Dict[str, Any]]:
         })
     return picks
 
-
-def mine_rules(df: pd.DataFrame) -> pd.DataFrame:
+def mine_rules(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Mine association rules between categorical factors (phase, light,
-    ATC advisory, cause category, risk level).
-    Returns a raw rules dataframe.
+    Return structured rules linking conditions -> elevated risk.
+
+    We:
+    - Define elevated risk as risk_level >= 4.0 (stricter, gives real contrast).
+    - One-hot encode operational conditions.
+    - Mine association rules where the CONSEQUENT is 'risk_high'.
+    - Compute uplift vs baseline.
+    - Filter out weak/noisy rules before returning.
+
+    Output:
+    {
+        "baseline_risk_rate": float,
+        "rules": [
+            {
+                "context": {...},           # structured factors
+                "context_text": "flight phase = Final Approach; cause = Procedure issue",
+                "support": 0.041,
+                "confidence": 0.92,
+                "lift": 2.4,
+                "n": 74,
+                "uplift": 2.4,
+                "narrative": "When flight phase = Final Approach; cause = Procedure issue, 92% of incidents were classified elevated risk (~2.4× baseline, 74 incidents)."
+            },
+            ...
+        ]
+    }
     """
-    cats = [
-        "flight_phase",
-        "light",
-        "atc_advisory",
-        "cause_category",
-        "risk_level",
-    ]
-    present = [c for c in cats if c in df.columns]
+    from mlxtend.frequent_patterns import apriori, association_rules
+    import numpy as np
+    import pandas as pd
 
-    if not present or df.empty:
-        return pd.DataFrame()
+    work = df.copy()
 
-    # one-hot encode categorical vars into boolean indicators
-    basket = pd.get_dummies(df[present].fillna("NA"))
-    basket = basket.astype(bool)
+    # --- 1. Define elevated risk (stricter than before)
+    def _elevated(x):
+        try:
+            return float(x) >= 4.0   # <-- tightened threshold
+        except Exception:
+            return False
 
-    if basket.empty:
-        return pd.DataFrame()
+    work["risk_high"] = work.get("risk_level", np.nan).apply(_elevated)
 
-    freq = apriori(basket, min_support=0.02, use_colnames=True)
-    if freq.empty:
-        return pd.DataFrame()
+    # --- 2. Canonicalise the categorical drivers we care about
+    cats = ["flight_phase", "light", "atc_advisory", "cause_category"]
+    for col in cats:
+        if col not in work.columns:
+            work[col] = "NA"
+        work[col] = (
+            work[col]
+            .fillna("NA")
+            .astype(str)
+            .str.strip()
+        )
 
-    rules = association_rules(freq, metric="lift", min_threshold=1.5)
-    rules = rules.sort_values(["lift", "confidence"], ascending=False)
-    return rules.reset_index(drop=True)
+    # --- 3. One-hot encode the drivers
+    onehots = []
+    for col in cats:
+        oh = pd.get_dummies(work[col], prefix=col, dtype=bool)
+        onehots.append(oh)
+    X = pd.concat(onehots, axis=1)
 
+    # attach the boolean target
+    X["risk_high"] = work["risk_high"].astype(bool)
 
+    total_n = len(work)
+    if total_n == 0:
+        return {
+            "baseline_risk_rate": 0.0,
+            "rules": [],
+        }
+
+    baseline = work["risk_high"].mean() if total_n else 0.0
+
+    # --- 4. Frequent itemsets / association rules
+    freq = apriori(X, min_support=0.02, use_colnames=True)
+    rules = association_rules(freq, metric="lift", min_threshold=1.0)
+
+    # keep only rules where consequent is exactly {'risk_high'}
+    def _is_only_risk_high(cons):
+        s = set(cons)
+        return len(s) == 1 and list(s)[0] == "risk_high"
+
+    rules = rules[rules["consequents"].apply(_is_only_risk_high)].copy()
+    if rules.empty:
+        return {
+            "baseline_risk_rate": baseline,
+            "rules": [],
+        }
+
+    # --- 5. Build structured rule records
+    records = []
+    for _, r in rules.iterrows():
+        ants = sorted(list(r["antecedents"]))
+        parts = []
+        ctx = {}
+
+        for a in ants:
+            if a.startswith("flight_phase_"):
+                v = a.replace("flight_phase_", "")
+                parts.append(f"flight phase = {v}")
+                ctx["flight_phase"] = v
+            elif a.startswith("light_"):
+                v = a.replace("light_", "")
+                parts.append(f"lighting = {v}")
+                ctx["light"] = v
+            elif a.startswith("atc_advisory_"):
+                v = a.replace("atc_advisory_", "")
+                parts.append(f"ATC = {v}")
+                ctx["atc_advisory"] = v
+            elif a.startswith("cause_category_"):
+                v = a.replace("cause_category_", "")
+                parts.append(f"cause = {v}")
+                ctx["cause_category"] = v
+
+        context_str = "; ".join(parts) if parts else "any context"
+
+        support = float(r["support"])
+        confidence = float(r["confidence"])
+        lift = float(r["lift"])
+        n = int(round(support * total_n))
+
+        uplift = (confidence / baseline) if baseline > 0 else float("nan")
+
+        narrative = (
+            f"When {context_str}, "
+            f"{int(round(confidence * 100))}% of incidents were classified elevated risk "
+            f"(~{uplift:.1f}× baseline, {n} incidents)."
+        )
+
+        records.append({
+            "context": ctx,
+            "context_text": context_str,
+            "support": support,
+            "confidence": confidence,
+            "lift": lift,
+            "n": n,
+            "uplift": uplift,
+            "narrative": narrative,
+        })
+
+    # --- 6. FILTER OUT NOISE before returning
+    cleaned = []
+    for r in records:
+        # must have meaningful uplift: at least 1.2x baseline (20% worse)
+        if r.get("uplift") is None or not (r["uplift"] == r["uplift"]):  # NaN check
+            continue
+        if r["uplift"] < 1.2:
+            continue
+
+        # must have real volume
+        if r.get("n", 0) < 30:
+            continue
+
+        # drop rules that are ONLY "ATC = NA" / missing data
+        ctx = r.get("context", {})
+        if (
+            list(ctx.keys()) == ["atc_advisory"] and
+            ctx.get("atc_advisory", "").lower() in ["na", "n/a", "not_available", "not available"]
+        ):
+            continue
+
+        cleaned.append(r)
+
+    # --- 7. Rank by uplift then volume
+    cleaned = sorted(
+        cleaned,
+        key=lambda x: (x["uplift"], x["n"]),
+        reverse=True,
+    )
+
+    return {
+        "baseline_risk_rate": baseline,
+        "rules": cleaned,
+    }
 
 
 # ----------------------------

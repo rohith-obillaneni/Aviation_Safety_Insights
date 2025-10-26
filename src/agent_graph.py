@@ -8,57 +8,79 @@ from openai import OpenAI
 from langgraph.graph import StateGraph, START, END
 
 from .config import get_settings
-from .utils import connect_pinecone, utc_today_iso
+from .utils import (
+    connect_pinecone,
+    utc_today_iso,
+    normalise_datetime_and_month,
+)
 from .retrieval import retrieve_for_question, compose_answer
 from .analytics import (
     sweep_collect,
     cluster_themes,
-    mine_rules,
-    generate_rule_narratives,
+    mine_rules,               # returns structured rules_bundle
     detect_anomalies,
     extract_critical5,
     compute_cluster_insights,
-    build_structured_bundle,
 )
 from .risk_engine import (
     compute_temporal_confidence,
-    build_watchlist,
-    build_run_metadata,
+    build_watchlist_from_rules,   # deduped watchlist builder
+    build_run_metadata,           # your existing run-metadata function
 )
 
-
-# -------------------------
-# Shared state
-# -------------------------
+# ------------------------------------------------------------------------------------
+# Shared state definition
+# ------------------------------------------------------------------------------------
 
 class AgentState(TypedDict, total=False):
+    # The full query string (including filters we appended like dates / phase)
     query: str
+
+    # The clean user question without our injected filters.
+    # We’ll use this for semantic retrieval so Pinecone stays on-topic.
+    user_question_raw: Optional[str]
+
     mode: Literal["ask", "discover"]
 
-    # ASK filters
+    # Filters (for ask mode)
     date_from: Optional[str]
     date_to: Optional[str]
     phase_filter: Optional[str]
 
-    # dataframes / analytics
+    # Dataframes / analytics
     df: pd.DataFrame
     stats: Dict[str, Any]
 
-    # richer discover info
+    # richer discover info (discover mode)
     discover_structured: Dict[str, Any]
     discover_bundle: Dict[str, Any]
 
-    # final answer
+    # final packaged answer
     answer: Dict[str, Any]
 
 
-# -------------------------
-# Helpers
-# -------------------------
+
+# ------------------------------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------------------------------
 
 def _parse_filters(query: str) -> Dict[str, Any]:
+    """
+    Interpret the user's combined query (natural language + our injected filters).
+
+    We do four things:
+    1. Decide mode ("ask" vs "discover").
+    2. Extract date_from / date_to if present.
+    3. Extract a flight phase filter, preferring the *last-mentioned* phase.
+       (We append `during {phase}` at the end of the query from the UI,
+        so the dropdown wins over whatever the user typed originally.)
+    4. Return everything back into agent state.
+    """
+
     ql = query.lower()
 
+    # 1. Mode routing: if user is asking for trends / patterns / spikes,
+    #    we go DISCOVER, otherwise ASK.
     discover_triggers = [
         "unique pattern",
         "unique patterns",
@@ -77,10 +99,13 @@ def _parse_filters(query: str) -> Dict[str, Any]:
         "risk radar",
         "risk patterns",
         "early warning",
+        "high risk",
+        "critical events",
     ]
     mode = "discover" if any(t in ql for t in discover_triggers) else "ask"
 
-    # detect date range yyyy-mm-dd .. yyyy-mm-dd
+    # 2. Extract date_from / date_to
+    # We look for `YYYY-MM-DD to YYYY-MM-DD`
     m = re.search(
         r"(\d{4}-\d{2}-\d{2})\s*(?:to|–|\.{2,})\s*(\d{4}-\d{2}-\d{2})",
         ql,
@@ -89,16 +114,45 @@ def _parse_filters(query: str) -> Dict[str, Any]:
     if m:
         date_from, date_to = m.group(1), m.group(2)
     else:
+        # Single date -> treat as both from and to
         m2 = re.search(r"(\d{4}-\d{2}-\d{2})", ql)
         if m2:
             date_from = m2.group(1)
             date_to = m2.group(1)
 
+    # 3. Extract flight phase.
+    # Instead of crude "if 'descent' in ql", we:
+    # - define known phases
+    # - find all that appear
+    # - pick the one that appears LAST in the query text
+    #   (so the dropdown-supplied `during Parked` at the end wins).
+    phase_map = {
+        "final approach": "Final Approach",
+        "initial approach": "Initial Approach",
+        "initial climb": "Initial Climb",
+        "take-off": "Takeoff",
+        "takeoff": "Takeoff",
+        "parked": "Parked",
+        "taxi": "Taxi",
+        "landing": "Landing",
+        "descent": "Descent",
+        "climb": "Climb",
+        "cruise": "Cruise",
+        "approach": "Approach",  # generic fallback
+    }
+
+    phase_matches = []
+    for needle, normalised in phase_map.items():
+        idx = ql.rfind(needle)
+        if idx != -1:
+            phase_matches.append((idx, normalised))
+
+    # choose the phase that appears LAST in the query
+    # (highest idx). If none found, leave as None.
     phase_filter = None
-    if "approach" in ql:
-        phase_filter = "Approach"
-    elif "takeoff" in ql or "take-off" in ql:
-        phase_filter = "Takeoff"
+    if phase_matches:
+        phase_matches.sort(key=lambda x: x[0])  # sort by index ascending
+        phase_filter = phase_matches[-1][1]     # take last one mentioned
 
     return {
         "mode": mode,
@@ -110,36 +164,28 @@ def _parse_filters(query: str) -> Dict[str, Any]:
 
 def _extract_output_text(resp) -> Optional[str]:
     """
-    Extract plain text from an OpenAI Responses API response safely.
-
-    We try:
-    1. resp.output[*].content[*].text (if present and iterable)
-    2. resp.output[*].text (some SDK variants)
-    3. resp.output_text (SDK convenience field)
-    4. legacy-style resp.data[0].content[0].text
-
-    We join all collected chunks.
+    Extract plain text from an OpenAI Responses API response.
+    Handles multiple SDK shapes safely.
     """
-    # 1. resp.output[*].content[*].text
+    # Preferred path: resp.output[*].content[*].text
     if hasattr(resp, "output") and resp.output is not None:
         chunks = []
-        for item in resp.output or []:
+        for item in (resp.output or []):
             maybe_content_list = getattr(item, "content", None)
             if maybe_content_list:
                 for content in maybe_content_list:
                     if hasattr(content, "text") and content.text is not None:
                         chunks.append(str(content.text))
-            # Some SDK variants put direct text on the item
             if hasattr(item, "text") and item.text:
                 chunks.append(str(item.text))
         if chunks:
             return "".join(chunks).strip()
 
-    # 2. resp.output_text convenience
+    # Convenience shortcut
     if hasattr(resp, "output_text") and resp.output_text:
         return str(resp.output_text).strip()
 
-    # 3. Very defensive legacy fallback
+    # Legacy-ish fallback
     if hasattr(resp, "data") and resp.data:
         try:
             first = resp.data[0]
@@ -154,55 +200,43 @@ def _extract_output_text(resp) -> Optional[str]:
     return None
 
 
-
 def _make_executive_summary(structured: Dict[str, Any]) -> str:
     """
-    Call OpenAI Responses API to produce a 1–2 paragraph exec brief:
-
-    - What is spiking
-    - Which clusters are high risk
-    - Which conditions are driving high risk
-    - Which incidents are critical
-
-    We ONLY pass structured data we've already computed.
-    We forbid invention in the prompt.
-
-    We deliberately keep the request simple (no reasoning.effort etc.)
-    to avoid model-parameter errors across different OpenAI models.
+    Generate a 2-paragraph exec brief for leadership.
+    - Only restates provided structured data.
+    - Calls out watchlist priorities and temporal confidence.
+    - Makes it clear this is early warning, not regulatory blame.
     """
     settings = get_settings()
     client = OpenAI(api_key=settings.openai_api_key)
 
-    headlines_hint = []
     wl = structured.get("watchlist", [])
+    headline_bits = []
     for item in wl[:3]:
-        headlines_hint.append(
+        headline_bits.append(
             f"- {item['context']}: {item['severity_statement']}"
         )
-    headlines_text = "\n".join(headlines_hint) if headlines_hint else "None."
+    headlines_text = "\n".join(headline_bits) if headline_bits else "None."
 
     temporal_conf = structured.get("temporal_confidence", "UNKNOWN")
 
     prompt = (
         "You are an internal aviation safety analyst. "
-        "Your job is to write an 'Operational Risk Radar' update.\n\n"
-        "You MUST follow these rules:\n"
-        "- ONLY use and restate the structured data provided.\n"
-        "- DO NOT invent causes, timelines, mitigations, time trends or counts.\n"
+        "Write an 'Operational Risk Radar' update for senior ops & safety leadership.\n\n"
+        "Rules you MUST follow:\n"
+        "- ONLY use the structured data provided.\n"
+        "- Do NOT invent causes, timelines, mitigations, trends, or counts that are not present.\n"
         "- Call out the watchlist items as priority focus areas.\n"
-        "- Mention any data confidence limits (temporal confidence).\n"
-        "- Cite report_numbers from Critical 5.\n"
-        "- Make it crystal clear this is early warning, not a regulatory finding.\n\n"
+        "- Acknowledge temporal confidence.\n"
+        "- Mention Critical 5 (by report_number) if present.\n"
+        "- Emphasise this is early warning, not a regulatory finding.\n\n"
         f"Headlines to restate in your own words:\n{headlines_text}\n\n"
         f"Temporal confidence in spike/trend detection: {temporal_conf}.\n\n"
         "Structured data:\n"
         f"{json.dumps(structured, indent=2)}\n\n"
-        "Write 2 short paragraphs for senior operations and safety leadership."
+        "Write 2 short paragraphs. Be direct, operational, factual."
     )
 
-
-    # Keep the call minimal: just model + input.
-    # This avoids the 'reasoning.effort' error you hit.
     resp = client.responses.create(
         model=settings.summary_model,
         input=prompt,
@@ -215,41 +249,102 @@ def _make_executive_summary(structured: Dict[str, Any]) -> str:
     return txt
 
 
-
-# -------------------------
-# Nodes
-# -------------------------
+# ------------------------------------------------------------------------------------
+# Graph nodes
+# ------------------------------------------------------------------------------------
 
 def plan_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Decide mode ('ask' vs 'discover') and extract basic filters.
+    """
     return _parse_filters(state["query"])
 
 
 def ask_node(state: AgentState) -> Dict[str, Any]:
     """
-    ASK path: retrieve semantically similar incidents for the question and compute stats.
+    ASK mode:
+    1. Build a clean semantic question for Pinecone retrieval
+       (strip vague time phrases like 'last week', 'today', etc.).
+    2. Retrieve incidents.
+    3. Apply user filters (date_from/date_to/phase).
+    4. If that filtered set is empty, fall back and retry with relaxed filters
+       (no date bounds) so we can still show something relevant.
+    5. Normalise datetime/month for plotting.
     """
+
     settings = get_settings()
+
+    # --- helper to clean the semantic query before embedding
+    def _clean_semantic_question(q: str) -> str:
+        """
+        Pinecone matching is semantic. Terms like 'last week', 'yesterday'
+        often aren't in the actual narratives, so they just add noise and
+        kill recall. We strip them so retrieval still finds relevant cases.
+        """
+        txt = q.strip()
+
+        # remove vague temporal phrases
+        txt = re.sub(
+            r"\b(last week|yesterday|today|tonight|recent|recently|this (morning|afternoon|evening))\b",
+            "",
+            txt,
+            flags=re.IGNORECASE,
+        )
+
+        # collapse multiple spaces
+        txt = re.sub(r"\s+", " ", txt).strip()
+        return txt
+
+    # 1. choose which question string we embed into Pinecone
+    raw_q = state.get("user_question_raw") or state["query"]
+    base_question_clean = _clean_semantic_question(raw_q)
+
+    # 2. first retrieval attempt with full filters
     df, stats = retrieve_for_question(
         settings=settings,
-        question=state["query"],
+        question=base_question_clean,
         date_from=state.get("date_from"),
         date_to=state.get("date_to"),
         phase=state.get("phase_filter"),
     )
+
+    # 3. if nothing came back, retry in a more forgiving way:
+    #    - same semantic scenario
+    #    - allow ANY date range (drop date_from/date_to)
+    #    - still keep phase if the user clearly asked about one
+    if (df is None or df.empty):
+        df2, stats2 = retrieve_for_question(
+            settings=settings,
+            question=base_question_clean,
+            date_from=None,
+            date_to=None,
+            phase=state.get("phase_filter"),
+        )
+        if df2 is not None and not df2.empty:
+            df, stats = df2, stats2
+
+    # 4. final normalisation for charts (month buckets, etc.)
+    df = normalise_datetime_and_month(df)
+
     return {
         "df": df,
         "stats": stats,
     }
 
 
+
 def discover_node(state: AgentState) -> Dict[str, Any]:
     """
-    DISCOVER path: sweep Pinecone using random probe vectors to collect a large,
-    de-duplicated sample across the dataset.
+    DISCOVER mode:
+    - Sweep Pinecone with random probe vectors to get a broad, deduped sample
+    - Then normalise datetime/month for temporal analysis later
     """
     settings = get_settings()
     index = connect_pinecone(settings)
     df = sweep_collect(index, settings)
+
+    df = normalise_datetime_and_month(df)
+
     return {
         "df": df,
     }
@@ -257,14 +352,16 @@ def discover_node(state: AgentState) -> Dict[str, Any]:
 
 def enrich_node(state: AgentState) -> Dict[str, Any]:
     """
-    After ask/discover:
-    - For ask: nothing special.
-    - For discover:
-        * cluster themes and rank by risk_priority
-        * anomaly flags
-        * rule narratives (conditions predicting High risk)
-        * Critical 5 serious incidents
-        * structured bundle for summariser + UI
+    After retrieval:
+    - ASK mode: we already have df + stats, so nothing extra.
+    - DISCOVER mode: run fleet-level analytics:
+        * cluster_themes → cluster labels / risk view
+        * detect_anomalies → mark outliers
+        * mine_rules → structured uplift rules (phase/light/etc → elevated risk)
+        * build_watchlist_from_rules → dedupe near-duplicates (eg "Parked" twice)
+        * extract_critical5 → most severe incidents
+        * compute_temporal_confidence → honesty about trend reliability
+        * build_run_metadata → audit trail for leadership
     """
     if state["mode"] == "ask":
         return {}
@@ -281,77 +378,114 @@ def enrich_node(state: AgentState) -> Dict[str, Any]:
             },
             "clusters_table": [],
             "rule_narratives": [],
+            "rules_struct": [],
             "critical5": [],
+            "temporal_confidence": "UNKNOWN",
+            "watchlist": [],
+            "run_metadata": {},
         }
         return {
             "discover_structured": structured,
             "df": df,
         }
 
-    # 1. cluster + label
+    # 1. Cluster themes (groups similar narratives / factors)
     dfx, _label_map = cluster_themes(df, seed=settings.seed)
 
-    # 2. anomaly flags (IsolationForest)
+    # 2. Anomaly detection (e.g. IsolationForest on miss_distance / altitude etc.)
     dfa = detect_anomalies(dfx, seed=settings.seed)
-    dfx["anomaly"] = dfa["anomaly"]
+    if "anomaly" in dfa.columns:
+        dfx["anomaly"] = dfa["anomaly"]
+    else:
+        dfx["anomaly"] = False
 
-    # 3. rules -> narratives
-    rules_df = mine_rules(dfx)
-    rule_lines = generate_rule_narratives(dfx, rules_df)
+    # 3. Association rules -> high-value structured risk relationships
+    rules_bundle = mine_rules(dfx)
+    all_rules_struct = rules_bundle.get("rules", [])
 
-    # 4. Critical 5 (high-risk, closest calls)
+    # Take only the strongest ~6 rules for reporting / readability.
+    top_rules_struct = all_rules_struct[:6]
+
+    # These short narratives feed "Elevated-risk conditions" in the UI.
+    rule_narratives = [r["narrative"] for r in top_rules_struct]
+
+    # 4. Critical 5 (highest-risk / closest calls)
     critical5 = extract_critical5(dfx)
 
-    # 5. cluster-level risk insights
+    # 5. Cluster-level risk table for UI
     clusters_info = compute_cluster_insights(dfx)
 
-    # 6. structured bundle for summary + UI
-    structured = build_structured_bundle(
-        dfx,
-        clusters_info,
-        rule_lines,
-        critical5,
-    )
+    # 6. Temporal confidence (how reliable is any apparent spike / trend)
     temporal_conf = compute_temporal_confidence(dfx)
-    watchlist = build_watchlist(rule_lines, critical5)
 
+    # 7. Watchlist from top rules (deduped + human readable)
+    watchlist = build_watchlist_from_rules(top_rules_struct, top_k=5)
+
+
+    # 8. Sample/methodology metadata
+    sample_meta = {
+        "total_incidents": int(len(dfx)),
+        "analysis_date": utc_today_iso(),
+        "methodology": (
+            "Sampled via random {dim}-dim vector sweep across Pinecone index "
+            "'{idx}' (cosine, {model}). Deduplicated by report_number. "
+            "Directional, not full-fleet statistics."
+        ).format(
+            dim=settings.vector_dim,
+            idx=settings.pinecone_index,
+            model=settings.embed_model,
+        ),
+    }
+
+    # 9. Run metadata for audit trail / transparency in UI
     run_meta = build_run_metadata(
-        sample=structured["sample"],
+        sample=sample_meta,
         temporal_confidence=temporal_conf,
         pinecone_index=settings.pinecone_index,
         model_name=settings.summary_model,
         seed=settings.seed,
     )
 
-    # add extras to structured so summary + UI can see them
-    structured["temporal_confidence"] = temporal_conf
-    structured["watchlist"] = watchlist
-    structured["run_metadata"] = run_meta
+    # 10. Final structured object for summariser + UI
+    structured = {
+        "sample": sample_meta,
+        "clusters_table": clusters_info,
+        "rule_narratives": rule_narratives,       # shortened narratives (top ~6)
+        "rules_struct": top_rules_struct,         # only high-value rules
+        "critical5": critical5,
+        "temporal_confidence": temporal_conf,
+        "watchlist": watchlist,
+        "run_metadata": run_meta,
+    }
+
+
 
     return {
-        "df": dfx,  # enriched dataframe w/ cluster, anomaly, etc.
+        "df": dfx,  # enriched dataframe (cluster labels, anomaly flag, etc.)
         "discover_structured": structured,
     }
 
 
 def summarise_node(state: AgentState) -> Dict[str, Any]:
     """
-    For discover:
-        - Call OpenAI to get exec summary (risk radar brief),
-          merge that back into a bundle we expose to the UI.
-    For ask:
-        - Nothing, we summarise later in format_node.
+    DISCOVER mode:
+        - Turn the structured analytics into an exec-facing summary.
+    ASK mode:
+        - Leave summarising to compose_answer in format_node.
     """
     if state["mode"] == "ask":
         return {}
 
     structured = state.get("discover_structured", {})
     if not structured:
+        # Fallback if something goes wrong upstream
         bundle = {
             "executive_summary": "No data to summarise.",
             "clusters_table": [],
             "rule_narratives": [],
             "critical5": [],
+            "watchlist": [],
+            "run_metadata": {},
             "sample": {
                 "total_incidents": 0,
                 "analysis_date": utc_today_iso(),
@@ -377,7 +511,9 @@ def summarise_node(state: AgentState) -> Dict[str, Any]:
 
 def format_node(state: AgentState) -> Dict[str, Any]:
     """
-    Final packaging into 'answer' for the UI.
+    Final packaging for Streamlit.
+    ASK mode: return slice summary, claims, charts, evidence.
+    DISCOVER mode: return fleet-level bundle.
     """
     if state["mode"] == "ask":
         out = compose_answer(
@@ -386,23 +522,34 @@ def format_node(state: AgentState) -> Dict[str, Any]:
         )
         return {"answer": out}
 
-    # discover
+    # discover mode
     return {"answer": state.get("discover_bundle", {})}
 
 
-# -------------------------
-# Routing
-# -------------------------
+# ------------------------------------------------------------------------------------
+# Routing & graph wiring
+# ------------------------------------------------------------------------------------
 
 def route_after_plan(state: AgentState):
-    return state["mode"]  # "ask" or "discover"
+    """
+    After planning, jump to either 'ask' or 'discover'.
+    LangGraph will branch to the node with that exact name.
+    """
+    return state["mode"]  # guaranteed "ask" or "discover"
 
-
-# -------------------------
-# Build graph
-# -------------------------
 
 def build_graph():
+    """
+    Build the LangGraph pipeline:
+
+    START
+      → plan
+      → (ask | discover)
+      → enrich
+      → summarise
+      → format
+      → END
+    """
     builder = StateGraph(AgentState)
 
     builder.add_node("plan", plan_node)
@@ -414,10 +561,10 @@ def build_graph():
 
     builder.add_edge(START, "plan")
 
-    # Branch after plan
+    # Conditional branch after planning
     builder.add_conditional_edges("plan", route_after_plan)
 
-    # ask & discover both feed enrich -> summarise -> format -> END
+    # Rejoin flow
     builder.add_edge("ask", "enrich")
     builder.add_edge("discover", "enrich")
     builder.add_edge("enrich", "summarise")
@@ -429,19 +576,29 @@ def build_graph():
 
 _compiled_graph = None
 
-def run_agentic(query: str) -> Dict[str, Any]:
+def run_agentic(
+    full_query: str,
+    raw_question: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Entry point Streamlit calls:
-    - Builds/uses compiled LangGraph agent pipeline
-    - Returns dict for UI
+    full_query:
+        The augmented query we build in the UI (includes dates / 'during Phase').
+        This is what _parse_filters() looks at to infer mode, date_from/date_to, etc.
+
+    raw_question:
+        The user's original free-text scenario. We use this (after cleaning) for
+        semantic retrieval in ASK so Pinecone isn't polluted by ranges, dates, etc.
     """
     global _compiled_graph
     if _compiled_graph is None:
         _compiled_graph = build_graph()
 
     init_state: AgentState = {
-        "query": query,
+        "query": full_query.strip(),
     }
+
+    if raw_question:
+        init_state["user_question_raw"] = raw_question.strip()
 
     final_state: AgentState = _compiled_graph.invoke(init_state)
 

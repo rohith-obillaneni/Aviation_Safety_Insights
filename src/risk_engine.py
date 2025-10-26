@@ -86,6 +86,77 @@ def compute_temporal_confidence(df: pd.DataFrame) -> str:
         return "MEDIUM"
     return "LOW"
 
+# --- ADD to src/risk_engine.py ---
+from typing import List, Dict, Any
+import math
+
+def _canon_key(ctx: Dict[str, str]) -> str:
+    """
+    Canonical grouping key for near-duplicate contexts.
+    We group by (phase, light, cause) when present. Adjust to taste.
+    """
+    phase = ctx.get("flight_phase", "").lower()
+    light = ctx.get("light", "").lower()
+    cause = ctx.get("cause_category", "").lower()
+    return f"phase:{phase}|light:{light}|cause:{cause}"
+
+def build_watchlist_from_rules(
+    rules_struct: List[Dict[str, Any]],
+    top_k: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Take the high-value rules (already filtered by mine_rules)
+    and convert them into a prioritised watchlist for ops/safety.
+
+    We expose:
+    - context (plain-English conditions)
+    - uplift_x  (times baseline risk)
+    - exposure_incidents (how many incidents)
+    - priority  (HIGH / MEDIUM)
+    - action_hint (what Ops / Safety should actually review)
+    """
+
+    def _action_hint(ctx_text: str) -> str:
+        low = ctx_text.lower()
+        if "final approach" in low or "initial approach" in low or "approach" in low:
+            return "Crew SOP / approach stability review."
+        if "lighting" in low or "not_available" in low or "night" in low:
+            return "Ramp / ground handling in low/no lighting."
+        if "equipment failure" in low or "failure" in low:
+            return "Review abnormal / emergency procedures and redundancy."
+        if "initial climb" in low or "climb" in low:
+            return "Review climb-out workload and callout discipline."
+        if "descent" in low or "landing" in low:
+            return "Stabilised descent / landing discipline review."
+        return "Audit procedures & briefing in this context."
+
+    enriched = []
+    for r in rules_struct:
+        ctx_text = r.get("context_text", "context")
+        uplift_val = float(r.get("uplift") or 0.0)
+        n_val = int(r.get("n", 0))
+
+        priority = "HIGH" if uplift_val >= 2.0 else "MEDIUM"
+
+        enriched.append({
+            "context": ctx_text,
+            "severity_statement": r.get("narrative"),
+            "uplift_x": round(uplift_val, 2),
+            "exposure_incidents": n_val,
+            "priority": priority,
+            "action_hint": _action_hint(ctx_text),
+            "evidence": [],  # (optionally attach Critical-5 IDs here later)
+        })
+
+    # sort strongest first: uplift × volume
+    enriched.sort(
+        key=lambda it: (it["uplift_x"] * max(it["exposure_incidents"], 1)),
+        reverse=True,
+    )
+
+    return enriched[:top_k]
+
+
 
 def build_watchlist(rule_narratives: List[str],
                     critical5: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
