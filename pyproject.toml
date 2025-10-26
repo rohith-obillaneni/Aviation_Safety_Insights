@@ -1,0 +1,32 @@
+[project]
+name = "aviation"
+version = "0.1.0"
+description = "Agentic RAG aviation safety insights (Ask + Discover) with LangGraph, Pinecone, Streamlit"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "Rohith Obillaneni", email = "rohith@headofai.ai" }
+]
+
+dependencies = [
+  "streamlit",
+  "numpy",
+  "pandas",
+  "matplotlib",
+  "scikit-learn",
+  "mlxtend",
+  "python-dotenv",
+  "python-dateutil",
+  "pinecone",              # modern Pinecone SDK
+  "openai",                # embeddings + summary
+  "langgraph",             # planner/agent orchestration
+  "langchain",             # light utilities
+  "sentence-transformers", # local fallback embeddings (optional)
+]
+
+[tool.uv]
+# optional: pin Python etc.
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
